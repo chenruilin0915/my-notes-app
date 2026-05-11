@@ -4,7 +4,7 @@ from supabase import create_client
 import base64
 from datetime import datetime
 
-# ── 配置（从 Streamlit Secrets 读取）─────────────────
+# ── 配置 ─────────────────────────────────────────
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 DEEPSEEK_KEY = st.secrets["DEEPSEEK_KEY"]
@@ -13,7 +13,7 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 st.set_page_config(page_title="我的知识库", page_icon="📚", layout="wide")
 
-# ── 工具函数 ───────────────────────────────────────
+# ── 工具函数 ──────────────────────────────────────
 TYPE_LABELS = {"text": "📝 文字", "image": "🖼️ 图片",
                "link": "🔗 链接", "audio": "🎵 音频", "video": "🎬 视频"}
 
@@ -27,8 +27,16 @@ def load_notes():
 def save_note(note):
     supabase.table("notes").insert(note).execute()
 
-def delete_note(note_id):
-    supabase.table("notes").delete().eq("id", note_id).execute()
+def update_note(note_id, title, content, url):
+    supabase.table("notes").update({
+        "title": title or None,
+        "content": content or None,
+        "url": url or None,
+    }).eq("id", note_id).execute()
+
+def delete_notes(ids):
+    for nid in ids:
+        supabase.table("notes").delete().eq("id", nid).execute()
 
 def notes_context(notes):
     if not notes:
@@ -42,25 +50,25 @@ def notes_context(notes):
         )
     return "\n\n".join(lines)
 
-# ── Session State 初始化 ───────────────────────────
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "selected" not in st.session_state:
-    st.session_state.selected = None
-if "notes" not in st.session_state:
-    st.session_state.notes = load_notes()
+# ── Session State 初始化 ──────────────────────────
+if "messages"      not in st.session_state: st.session_state.messages      = []
+if "selected"      not in st.session_state: st.session_state.selected      = None
+if "notes"         not in st.session_state: st.session_state.notes         = load_notes()
+if "checked"       not in st.session_state: st.session_state.checked       = set()
+if "editing_id"    not in st.session_state: st.session_state.editing_id    = None
 
-# ── 布局 ──────────────────────────────────────────
+# ── 布局 ─────────────────────────────────────────
 left, mid, right = st.columns([1.2, 2, 1.4])
 
 # ════════════════════════════════
-#  左栏：笔记列表
+#  左栏：笔记列表（含勾选）
 # ════════════════════════════════
 with left:
     st.markdown("### 📚 知识库")
 
     if st.button("🔄 刷新", use_container_width=True):
-        st.session_state.notes = load_notes()
+        st.session_state.notes  = load_notes()
+        st.session_state.checked = set()
         st.rerun()
 
     search = st.text_input("搜索", placeholder="关键词…", label_visibility="collapsed")
@@ -75,33 +83,83 @@ with left:
     if not filtered:
         st.caption("还没有笔记，在中间添加吧～")
 
+    # 笔记列表（勾选框 + 标题按钮）
     for n in filtered:
-        label = f"{TYPE_LABELS.get(n['type'],'?')}  {n.get('title') or (n.get('content') or '')[:20] or '（无标题）'}"
-        if st.button(label, key=f"sel_{n['id']}", use_container_width=True):
-            st.session_state.selected = n["id"]
+        col_check, col_title = st.columns([0.08, 0.92])
+        with col_check:
+            checked = st.checkbox(
+                "", value=(n["id"] in st.session_state.checked),
+                key=f"chk_{n['id']}", label_visibility="collapsed"
+            )
+            if checked:
+                st.session_state.checked.add(n["id"])
+            else:
+                st.session_state.checked.discard(n["id"])
+        with col_title:
+            label = f"{TYPE_LABELS.get(n['type'],'?')} {n.get('title') or (n.get('content') or '')[:20] or '（无标题）'}"
+            if st.button(label, key=f"sel_{n['id']}", use_container_width=True):
+                st.session_state.selected  = n["id"]
+                st.session_state.editing_id = None
 
+    # 多选操作栏
     st.divider()
-    if st.session_state.selected:
-        if st.button("🗑️ 删除选中笔记", use_container_width=True):
-            delete_note(st.session_state.selected)
-            st.session_state.notes = load_notes()
-            st.session_state.selected = None
-            st.rerun()
+    n_checked = len(st.session_state.checked)
+    if n_checked > 0:
+        st.caption(f"已选 {n_checked} 条")
+        col_e, col_d, col_c = st.columns(3)
+        with col_e:
+            if n_checked == 1 and st.button("✏️ 编辑", use_container_width=True):
+                st.session_state.editing_id = next(iter(st.session_state.checked))
+                st.session_state.selected   = st.session_state.editing_id
+                st.rerun()
+        with col_d:
+            if st.button("🗑️ 删除", use_container_width=True):
+                delete_notes(list(st.session_state.checked))
+                st.session_state.notes   = load_notes()
+                st.session_state.checked = set()
+                st.session_state.selected = None
+                st.rerun()
+        with col_c:
+            if st.button("✕ 取消", use_container_width=True):
+                st.session_state.checked    = set()
+                st.session_state.editing_id = None
+                st.rerun()
 
 # ════════════════════════════════
-#  中间：详情 + 添加笔记
+#  中间：详情 / 编辑 / 添加
 # ════════════════════════════════
 with mid:
     selected_note = next(
         (n for n in st.session_state.notes if n["id"] == st.session_state.selected), None
     )
 
-    if selected_note:
+    # 编辑模式
+    if st.session_state.editing_id and selected_note:
+        st.markdown("#### ✏️ 编辑笔记")
+        new_title   = st.text_input("标题", value=selected_note.get("title") or "")
+        new_content = st.text_area("内容", value=selected_note.get("content") or "", height=160)
+        new_url     = st.text_input("链接", value=selected_note.get("url") or "")
+        col_s, col_x = st.columns(2)
+        with col_s:
+            if st.button("💾 保存修改", type="primary", use_container_width=True):
+                update_note(selected_note["id"], new_title, new_content, new_url)
+                st.session_state.notes      = load_notes()
+                st.session_state.editing_id = None
+                st.session_state.checked    = set()
+                st.success("已保存！")
+                st.rerun()
+        with col_x:
+            if st.button("取消", use_container_width=True):
+                st.session_state.editing_id = None
+                st.rerun()
+        st.divider()
+
+    # 详情模式
+    elif selected_note:
         st.markdown(f"#### {selected_note.get('title') or '（无标题）'}")
         st.caption(f"{TYPE_LABELS.get(selected_note['type'])} · {fmt_date(selected_note['created_at'])}")
         if selected_note.get("tags"):
             st.markdown(" ".join(f"`{t}`" for t in selected_note["tags"]))
-
         t = selected_note["type"]
         if t == "text":
             st.markdown(selected_note.get("content", ""))
@@ -116,6 +174,7 @@ with mid:
             st.video(base64.b64decode(selected_note["data"]))
         st.divider()
 
+    # 添加笔记
     with st.expander("➕ 添加笔记", expanded=not selected_note):
         note_type = st.selectbox("类型", list(TYPE_LABELS.keys()),
                                  format_func=lambda x: TYPE_LABELS[x])
@@ -136,18 +195,18 @@ with mid:
 
         if st.button("保存笔记", type="primary"):
             new_note = {
-                "id":        str(datetime.now().timestamp()),
-                "type":      note_type,
-                "title":     title or None,
-                "tags":      [t.strip() for t in tags.split(",") if t.strip()],
-                "content":   content or None,
-                "url":       url or None,
-                "data":      file_data or None,
-                "filename":  filename or None,
+                "id":         str(datetime.now().timestamp()),
+                "type":       note_type,
+                "title":      title or None,
+                "tags":       [t.strip() for t in tags.split(",") if t.strip()],
+                "content":    content or None,
+                "url":        url or None,
+                "data":       file_data or None,
+                "filename":   filename or None,
                 "created_at": datetime.now().isoformat(),
             }
             save_note(new_note)
-            st.session_state.notes = load_notes()
+            st.session_state.notes    = load_notes()
             st.session_state.selected = new_note["id"]
             st.success("已保存！")
             st.rerun()
